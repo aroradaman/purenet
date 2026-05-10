@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package cni.v1;
+
+option go_package = "github.com/aroradaman/purenet/pkg/cni";
+
+// CNIBackend is implemented by the purenet agent.  The thin CNI binary that
+// containerd invokes on every pod lifecycle event is just a gRPC client that
+// forwards requests here over a Unix domain socket.
+service CNIBackend {
+  rpc CmdAdd   (CNIRequest) returns (CNIResponse) {}
+  rpc CmdDel   (CNIRequest) returns (CNIResponse) {}
+  rpc CmdCheck (CNIRequest) returns (CNIResponse) {}
+}
+
+// CNIRequest carries all the information containerd passes to the CNI binary
+// via environment variables and stdin.
+message CNIRequest {
+  string container_id = 1;
+  string netns        = 2;
+  string if_name      = 3;
+  string args         = 4; // CNI_ARGS value
+  string path         = 5; // CNI_PATH value
+  bytes  config       = 6; // raw stdin JSON (the CNI network config)
+}
+
+// CNIResponse is returned by the agent for every CNI command.
+message CNIResponse {
+  uint32 error_code    = 1; // 0 = success; non-zero = CNI error code
+  string error_message = 2;
+  bytes  result        = 3; // serialised CNI result JSON (ADD only)
+}

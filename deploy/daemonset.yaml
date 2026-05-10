@@ -1,0 +1,143 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: purenet
+  namespace: kube-system
+  labels:
+    app: purenet
+spec:
+  selector:
+    matchLabels:
+      app: purenet
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: purenet
+    spec:
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      serviceAccountName: purenet
+
+      initContainers:
+        # ── install-cni ─────────────────────────────────────────────────────
+        # Runs once per node on (re)start.  Copies the CNI shim and upstream
+        # plugin binaries onto the host, then writes an initial network config.
+        # The agent container will overwrite the config with the per-node CIDR.
+        - name: install-cni
+          image: purenet:dev
+          imagePullPolicy: Never
+          command: ["/install.sh"]
+          env:
+            - name: CNI_BIN_DIR
+              value: /host/opt/cni/bin
+            - name: CNI_CONF_DIR
+              value: /host/etc/cni/net.d
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: cni-bin
+              mountPath: /host/opt/cni/bin
+            - name: cni-conf
+              mountPath: /host/etc/cni/net.d
+
+      containers:
+        # ── agent ───────────────────────────────────────────────────────────
+        # Long-running gRPC server.  Watches Kubernetes nodes to maintain
+        # host routes (ip route add <remote-pod-cidr> via <remote-node-ip>)
+        # and writes the per-node CNI config so IPAM allocates from the right
+        # /24.  Every time containerd invokes the purenet shim, the shim
+        # connects here and forwards the CNI request via gRPC.
+        - name: agent
+          image: purenet:dev
+          imagePullPolicy: Never
+          env:
+            # IPAM forks host-local; it searches CNI_PATH for the binary.
+            - name: CNI_PATH
+              value: /opt/cni/bin
+            # Tune log verbosity: 0=errors only, 4=full debug.
+            - name: PURENET_LOG_V
+              value: "4"
+            # Kubernetes node name — used to look up node.spec.podCIDR and to
+            # skip adding a route to ourselves when watching other nodes.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            privileged: true
+          volumeMounts:
+            # ── Pod network namespaces ────────────────────────────────────
+            # Containerd creates each pod's netns on the HOST as a bind mount
+            # at /var/run/netns/cni-xxx AFTER the agent pod is already running.
+            # HostToContainer propagation makes those bind mounts visible here.
+            - name: host-netns
+              mountPath: /var/run/netns
+              mountPropagation: HostToContainer
+
+            # ── IPAM state ────────────────────────────────────────────────
+            # host-local stores IP allocations at /var/lib/cni/networks/.
+            # Must be the host path so allocations survive agent pod restarts.
+            - name: cni-state
+              mountPath: /var/lib/cni
+
+            # ── gRPC socket ───────────────────────────────────────────────
+            # Shared between the agent and the host-side shim binary.
+            - name: socket-dir
+              mountPath: /var/run/purenet
+
+            # ── Log file ──────────────────────────────────────────────────
+            - name: log-dir
+              mountPath: /var/log/purenet
+
+            # ── CNI config ────────────────────────────────────────────────
+            # The agent writes the per-node CNI config (with the correct IPAM
+            # subnet) to this path after learning the node's pod CIDR from the
+            # Kubernetes API.
+            - name: cni-conf
+              mountPath: /host/etc/cni/net.d
+
+          # Readiness: socket exists means the agent is ready to serve RPCs.
+          readinessProbe:
+            exec:
+              command: ["test", "-S", "/var/run/purenet/cni.sock"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+
+      volumes:
+        - name: cni-bin
+          hostPath:
+            path: /opt/cni/bin
+            type: DirectoryOrCreate
+        - name: cni-conf
+          hostPath:
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate
+        - name: host-netns
+          hostPath:
+            path: /var/run/netns
+            type: DirectoryOrCreate
+        - name: cni-state
+          hostPath:
+            path: /var/lib/cni
+            type: DirectoryOrCreate
+        - name: socket-dir
+          hostPath:
+            path: /var/run/purenet
+            type: DirectoryOrCreate
+        - name: log-dir
+          hostPath:
+            path: /var/log/purenet
+            type: DirectoryOrCreate

@@ -1,0 +1,34 @@
+---
+# ServiceAccount used by the purenet agent pods so they can authenticate
+# to the Kubernetes API server with a scoped identity.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: purenet
+  namespace: kube-system
+
+---
+# ClusterRole grants read access to Node objects.  The agent watches nodes to
+# learn each node's pod CIDR and internal IP so it can maintain host routes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: purenet
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: purenet
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: purenet
+subjects:
+  - kind: ServiceAccount
+    name: purenet
+    namespace: kube-system

@@ -1,0 +1,15 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  # Disable kind's built-in CNI (kindnet) so purenet takes over.
+  disableDefaultCNI: true
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+  kubeProxyMode: "nftables"
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.35.1
+  - role: worker
+    image: kindest/node:v1.35.1
+  - role: worker
+    image: kindest/node:v1.35.1
