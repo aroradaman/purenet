@@ -116,6 +116,15 @@ spec:
             initialDelaySeconds: 2
             periodSeconds: 5
 
+          # Liveness: /healthz returns a 5-7-5 about the node.  Always 200
+          # unless the HTTP server itself is wedged.  See pkg/agent/haiku.go.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
       volumes:
         - name: cni-bin
           hostPath:

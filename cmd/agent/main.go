@@ -6,10 +6,12 @@ import (
 	"context"
 	"flag"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 	"k8s.io/client-go/kubernetes"
@@ -24,6 +26,7 @@ import (
 const (
 	logFile     = "/var/log/purenet/purenet.log"
 	cniConfPath = "/host/etc/cni/net.d/10-purenet.conf"
+	healthzAddr = ":8081"
 )
 
 func init() {
@@ -106,8 +109,28 @@ func main() {
 		}
 	}()
 
+	// ── Haiku healthz ─────────────────────────────────────────────────────────
+	// /healthz returns a 5-7-5 reflecting the current node state.  Liveness
+	// probes get a 200; the body is for the humans reading `curl` output.
+	mux := http.NewServeMux()
+	mux.Handle("/healthz", agent.HaikuHealthzHandler(nodeName))
+	healthzSrv := &http.Server{
+		Addr:              healthzAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		klog.InfoS("haiku healthz listening", "addr", healthzAddr)
+		if err := healthzSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			klog.ErrorS(err, "healthz server stopped")
+		}
+	}()
+
 	<-ctx.Done()
 	klog.InfoS("Shutting down")
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	_ = healthzSrv.Shutdown(shutdownCtx)
 	srv.GracefulStop()
 	klog.InfoS("purenet agent stopped")
 }
