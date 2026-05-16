@@ -53,11 +53,11 @@ The brain. Runs with `hostNetwork: true` and `privileged: true`. Responsible for
 |---|---|
 | **gRPC server** | Handles `CmdAdd`, `CmdDel`, `CmdCheck` RPCs from the shim |
 | **Veth management** | Creates/deletes a veth pair per pod; one end in the pod netns, one on the host |
-| **IPAM** | Forks `host-local` with the per-node pod CIDR to allocate/release IPs |
+| **IPAM** | In-process allocator (`pkg/ipam`): assigns IPs from the node's pod CIDR without forking any external binary; state is persisted to `/var/lib/cni/networks/purenet/allocations.cbor` using CBOR |
 | **Host routes** | Adds a `/32` route on the host for each pod IP so kubelet probes reach the pod |
 | **Proxy ARP** | Enables `proxy_arp` on host veths so pods can ARP-resolve their default gateway |
 | **Node sync** | Watches Kubernetes `Node` objects and programs inter-node routes (see below) |
-| **CNI config** | Writes a per-node `/etc/cni/net.d/10-purenet.conf` with the correct IPAM subnet |
+| **CNI config** | Writes a minimal `/etc/cni/net.d/10-purenet.conf` per node (no IPAM section needed) |
 
 #### `pkg/nodesync` — host-gateway inter-node routing
 
@@ -89,7 +89,7 @@ containerd
     │
     │  fork-exec /opt/cni/bin/purenet
     │  env: CNI_COMMAND=ADD CNI_CONTAINERID=... CNI_NETNS=...
-    │  stdin: { "type": "purenet", "ipam": { ... } }
+    │  stdin: { "type": "purenet", "mtu": 1500 }
     │
     ▼
 purenet shim
@@ -106,9 +106,10 @@ purenet agent (CmdAdd)
     ├─ 3. Bring up host veth
     │       enable proxy_arp on host veth
     │
-    ├─ 4. Fork host-local IPAM (ADD)
+    ├─ 4. In-process IPAM (pkg/ipam) — no fork
     │       allocates IP from node's pod CIDR (e.g. 10.244.1.5/24)
-    │       gateway = 10.244.1.1
+    │       gateway = 10.244.1.1  (first host address in the subnet)
+    │       persists allocation to allocations.cbor (atomic rename)
     │
     ├─ 5. Add /32 host route:  10.244.1.5 dev vethXXXXXXXXXXX
     │
@@ -173,7 +174,8 @@ purenet/
 │   ├── cni/            # gRPC contract: CNIRequest/CNIResponse, client+server stubs
 │   ├── config/         # CNI config JSON parsing (NetConf struct)
 │   ├── network/        # Linux network primitives: veth, routes, proxy ARP
-│   ├── agent/          # CmdAdd/Del/Check implementation, IPAM delegation
+│   ├── ipam/           # In-process IP allocator: Add/Del/Check + CBOR persistence
+│   ├── agent/          # CmdAdd/Del/Check implementation, wires veth + IPAM + routes
 │   └── nodesync/       # Kubernetes node informer + host-gateway route manager
 ├── deploy/
 │   ├── kind-config.yaml  # Kind cluster config (disableDefaultCNI, podSubnet)
@@ -183,7 +185,7 @@ purenet/
 │   └── install.sh        # init container script: copies binaries + config to host
 ├── config/
 │   └── 10-purenet.conf   # initial CNI config template (agent overwrites per-node)
-└── Dockerfile            # multi-stage: builder → cni-plugins → final (Alpine)
+└── Dockerfile            # multi-stage: builder → final (Alpine); no cni-plugins stage needed
 ```
 
 ---
@@ -225,6 +227,6 @@ make kind-down
 
 **JSON over the wire** — using `application/grpc+json` instead of protobuf binary makes the gRPC traffic trivially inspectable with `grpcurl` or a packet capture.
 
-**host-local IPAM delegation** — rather than implementing IP allocation from scratch, the agent forks the upstream `host-local` binary. The key detail is passing `ContainerID`, `NetNS`, and `IfName` explicitly via `invoke.Args` rather than relying on `os.Environ()` (which doesn't have these per-invocation variables in a long-running process).
+**In-process IPAM** — IP allocation is handled entirely inside the agent by `pkg/ipam.Allocator`. It keeps two in-memory maps (`containerID→IP` and `IP→containerID`) protected by a mutex, derives the gateway as the first host address in the subnet, and scans from offset 2 to find a free IP on each `Add`. State is persisted to disk as a CBOR file (`allocations.cbor`) using an atomic tmp-file + rename so allocations survive agent restarts without double-allocating IPs. This removes the fork/exec overhead on every pod event and eliminates the external `host-local` binary dependency from the image entirely.
 
 **Host-gateway routing** — each node gets a unique `/24` from the cluster's `/16` pod CIDR. The `nodesync` controller maintains one `ip route` entry per remote node. No overlay, no NAT.

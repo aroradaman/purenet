@@ -20,8 +20,9 @@ echo "==> Installing purenet CNI"
 mkdir -p "$CNI_BIN_DIR" "$CNI_CONF_DIR"
 
 # ── 1. Install binaries ──────────────────────────────────────────────────────
-# Copy every binary from the image into the host's CNI bin directory.
-for bin in purenet host-local loopback portmap; do
+# Copy the purenet shim into the host's CNI bin directory.
+# No external IPAM binaries needed — IP allocation is handled in-process.
+for bin in purenet; do
     echo "    installing $bin"
     install -m 0755 "$CNI_BIN_SRC/$bin" "$CNI_BIN_DIR/$bin"
 done

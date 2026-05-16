@@ -9,12 +9,9 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"runtime"
 	"sync"
 
-	"github.com/containernetworking/cni/pkg/invoke"
 	"github.com/containernetworking/cni/pkg/types"
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/plugins/pkg/ns"
@@ -23,6 +20,7 @@ import (
 
 	"github.com/aroradaman/purenet/pkg/cni"
 	"github.com/aroradaman/purenet/pkg/config"
+	"github.com/aroradaman/purenet/pkg/ipam"
 	"github.com/aroradaman/purenet/pkg/network"
 )
 
@@ -32,11 +30,15 @@ type Server struct {
 	// containerAccess serialises concurrent gRPC calls for the same container
 	// ID, preventing races between ADD and DEL for the same container.
 	containerAccess *containerAccessArbitrator
+	alloc           *ipam.Allocator
 }
 
 // NewServer creates a Server ready to serve gRPC requests.
-func NewServer() *Server {
-	return &Server{containerAccess: newContainerAccessArbitrator()}
+func NewServer(alloc *ipam.Allocator) *Server {
+	return &Server{
+		containerAccess: newContainerAccessArbitrator(),
+		alloc:           alloc,
+	}
 }
 
 // containerAccessArbitrator ensures at most one in-flight RPC per container ID.
@@ -88,7 +90,7 @@ func (s *Server) CmdAdd(_ context.Context, req *cni.CNIRequest) (*cni.CNIRespons
 	s.containerAccess.lock(req.ContainerID)
 	defer s.containerAccess.unlock(req.ContainerID)
 
-	result, err := cmdAdd(req)
+	result, err := s.cmdAdd(req)
 	if err != nil {
 		klog.ErrorS(err, "CmdAdd failed", "containerID", shortID(req.ContainerID))
 		return cni.ErrorResponse(cni.ErrorCodeConfigInterfaceFailure, err), nil
@@ -116,7 +118,7 @@ func (s *Server) CmdDel(_ context.Context, req *cni.CNIRequest) (*cni.CNIRespons
 	s.containerAccess.lock(req.ContainerID)
 	defer s.containerAccess.unlock(req.ContainerID)
 
-	if err := cmdDel(req); err != nil {
+	if err := s.cmdDel(req); err != nil {
 		klog.ErrorS(err, "CmdDel failed", "containerID", shortID(req.ContainerID))
 		return cni.ErrorResponse(cni.ErrorCodeConfigInterfaceFailure, err), nil
 	}
@@ -135,7 +137,7 @@ func (s *Server) CmdCheck(_ context.Context, req *cni.CNIRequest) (*cni.CNIRespo
 	s.containerAccess.lock(req.ContainerID)
 	defer s.containerAccess.unlock(req.ContainerID)
 
-	if err := cmdCheck(req); err != nil {
+	if err := s.cmdCheck(req); err != nil {
 		klog.ErrorS(err, "CmdCheck failed", "containerID", shortID(req.ContainerID))
 		return cni.ErrorResponse(cni.ErrorCodeCheckInterfaceFailure, err), nil
 	}
@@ -146,7 +148,7 @@ func (s *Server) CmdCheck(_ context.Context, req *cni.CNIRequest) (*cni.CNIRespo
 
 // ── internal implementation ───────────────────────────────────────────────────
 
-func cmdAdd(req *cni.CNIRequest) (*current.Result, error) {
+func (s *Server) cmdAdd(req *cni.CNIRequest) (*current.Result, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -158,7 +160,6 @@ func cmdAdd(req *cni.CNIRequest) (*current.Result, error) {
 		"containerID", shortID(req.ContainerID),
 		"cniVersion", conf.CNIVersion,
 		"mtu", conf.MTU,
-		"ipamType", conf.IPAM.Type,
 	)
 
 	netNS, err := ns.GetNS(req.Netns)
@@ -219,33 +220,30 @@ func cmdAdd(req *cni.CNIRequest) (*current.Result, error) {
 	}
 	klog.V(4).InfoS("Proxy ARP enabled", "containerID", shortID(req.ContainerID), "hostVeth", hostIface.Name)
 
-	klog.V(4).InfoS("Calling IPAM add",
-		"containerID", shortID(req.ContainerID),
-		"ipamType", conf.IPAM.Type,
-		"ifName", req.IfName,
-		"cniPath", os.Getenv("CNI_PATH"),
-	)
-	ipamResult, err := execIPAMAdd(context.Background(), conf.IPAM.Type, req)
+	podIP, gw, err := s.alloc.Add(req.ContainerID)
 	if err != nil {
-		return nil, fmt.Errorf("IPAM %q add failed: %w", conf.IPAM.Type, err)
+		return nil, fmt.Errorf("IPAM add failed: %w", err)
 	}
-
-	result, err := current.NewResultFromResult(ipamResult)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert IPAM result: %w", err)
-	}
-	if len(result.IPs) == 0 {
-		return nil, fmt.Errorf("IPAM returned no IP addresses")
-	}
-	klog.V(2).InfoS("IPAM allocated IPs",
+	klog.V(2).InfoS("IPAM allocated IP",
 		"containerID", shortID(req.ContainerID),
-		"ips", result.IPs,
-		"gateway", result.IPs[0].Gateway,
+		"ip", podIP,
+		"gateway", gw,
 	)
 
-	result.Interfaces = []*current.Interface{hostIface, contIface}
-	for _, ip := range result.IPs {
-		ip.Interface = current.Int(1)
+	_, defaultNet, _ := net.ParseCIDR("0.0.0.0/0")
+	result := &current.Result{
+		CNIVersion: conf.CNIVersion,
+		Interfaces: []*current.Interface{hostIface, contIface},
+		IPs: []*current.IPConfig{
+			{
+				Interface: current.Int(1),
+				Address:   net.IPNet{IP: podIP, Mask: s.alloc.Subnet().Mask},
+				Gateway:   gw,
+			},
+		},
+		Routes: []*types.Route{
+			{Dst: *defaultNet},
+		},
 	}
 
 	// Add a /32 host route for each pod IP so the host kernel can reach the
@@ -275,11 +273,11 @@ func cmdAdd(req *cni.CNIRequest) (*current.Result, error) {
 			}
 		}
 		for _, route := range result.Routes {
-			gw := route.GW
-			if gw == nil && len(result.IPs) > 0 {
-				gw = result.IPs[0].Gateway
+			routeGW := route.GW
+			if routeGW == nil && len(result.IPs) > 0 {
+				routeGW = result.IPs[0].Gateway
 			}
-			if gw == nil {
+			if routeGW == nil {
 				klog.V(4).InfoS("Skipping route — no gateway",
 					"containerID", shortID(req.ContainerID),
 					"dst", route.Dst,
@@ -289,10 +287,10 @@ func cmdAdd(req *cni.CNIRequest) (*current.Result, error) {
 			klog.V(4).InfoS("Adding route",
 				"containerID", shortID(req.ContainerID),
 				"dst", route.Dst,
-				"gw", gw,
+				"gw", routeGW,
 			)
-			if routeErr := netlink.RouteAdd(&netlink.Route{Dst: &route.Dst, Gw: gw}); routeErr != nil {
-				return fmt.Errorf("failed to add route %v via %v: %w", route.Dst, gw, routeErr)
+			if routeErr := netlink.RouteAdd(&netlink.Route{Dst: &route.Dst, Gw: routeGW}); routeErr != nil {
+				return fmt.Errorf("failed to add route %v via %v: %w", route.Dst, routeGW, routeErr)
 			}
 		}
 		return nil
@@ -311,22 +309,11 @@ func cmdAdd(req *cni.CNIRequest) (*current.Result, error) {
 	return typedResult, nil
 }
 
-func cmdDel(req *cni.CNIRequest) error {
+func (s *Server) cmdDel(req *cni.CNIRequest) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	conf, err := config.LoadConf(req.Config)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
-
-	klog.V(4).InfoS("Calling IPAM del",
-		"containerID", shortID(req.ContainerID),
-		"ipamType", conf.IPAM.Type,
-		"ifName", req.IfName,
-		"cniPath", os.Getenv("CNI_PATH"),
-	)
-	if err := execIPAMDel(context.Background(), conf.IPAM.Type, req); err != nil {
+	if err := s.alloc.Del(req.ContainerID); err != nil {
 		return fmt.Errorf("IPAM delete failed: %w", err)
 	}
 	klog.V(4).InfoS("IPAM del complete", "containerID", shortID(req.ContainerID))
@@ -357,20 +344,11 @@ func cmdDel(req *cni.CNIRequest) error {
 	})
 }
 
-func cmdCheck(req *cni.CNIRequest) error {
+func (s *Server) cmdCheck(req *cni.CNIRequest) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	conf, err := config.LoadConf(req.Config)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
-
-	klog.V(4).InfoS("Calling IPAM check",
-		"containerID", shortID(req.ContainerID),
-		"ipamType", conf.IPAM.Type,
-	)
-	if err := execIPAMCheck(context.Background(), conf.IPAM.Type, req); err != nil {
+	if _, err := s.alloc.Check(req.ContainerID); err != nil {
 		return fmt.Errorf("IPAM check failed: %w", err)
 	}
 
@@ -402,91 +380,6 @@ func cmdCheck(req *cni.CNIRequest) error {
 		)
 		return nil
 	})
-}
-
-// ── IPAM helpers ──────────────────────────────────────────────────────────────
-//
-// ipam.ExecAdd / ExecDel from containernetworking/plugins inherit os.Environ()
-// and only append CNI_COMMAND.  The agent is a long-running process and never
-// has CNI_CONTAINERID / CNI_IFNAME in its environment, so host-local would fail
-// with "required env variables missing".  We therefore call
-// invoke.ExecPluginWithResult / WithoutResult directly and pass the per-request
-// args explicitly.
-
-func execIPAMAdd(ctx context.Context, ipamType string, req *cni.CNIRequest) (types.Result, error) {
-	pluginPath, err := findIPAMPlugin(ipamType)
-	if err != nil {
-		return nil, err
-	}
-	args := &invoke.Args{
-		Command:     "ADD",
-		ContainerID: req.ContainerID,
-		NetNS:       req.Netns,
-		IfName:      req.IfName,
-		Path:        os.Getenv("CNI_PATH"),
-	}
-	klog.V(4).InfoS("Forking IPAM binary",
-		"plugin", pluginPath,
-		"command", "ADD",
-		"containerID", shortID(req.ContainerID),
-		"ifName", req.IfName,
-	)
-	return invoke.ExecPluginWithResult(ctx, pluginPath, req.Config, args, nil)
-}
-
-func execIPAMDel(ctx context.Context, ipamType string, req *cni.CNIRequest) error {
-	pluginPath, err := findIPAMPlugin(ipamType)
-	if err != nil {
-		return err
-	}
-	args := &invoke.Args{
-		Command:     "DEL",
-		ContainerID: req.ContainerID,
-		NetNS:       req.Netns,
-		IfName:      req.IfName,
-		Path:        os.Getenv("CNI_PATH"),
-	}
-	klog.V(4).InfoS("Forking IPAM binary",
-		"plugin", pluginPath,
-		"command", "DEL",
-		"containerID", shortID(req.ContainerID),
-		"ifName", req.IfName,
-	)
-	return invoke.ExecPluginWithoutResult(ctx, pluginPath, req.Config, args, nil)
-}
-
-func execIPAMCheck(ctx context.Context, ipamType string, req *cni.CNIRequest) error {
-	pluginPath, err := findIPAMPlugin(ipamType)
-	if err != nil {
-		return err
-	}
-	args := &invoke.Args{
-		Command:     "CHECK",
-		ContainerID: req.ContainerID,
-		NetNS:       req.Netns,
-		IfName:      req.IfName,
-		Path:        os.Getenv("CNI_PATH"),
-	}
-	klog.V(4).InfoS("Forking IPAM binary",
-		"plugin", pluginPath,
-		"command", "CHECK",
-		"containerID", shortID(req.ContainerID),
-		"ifName", req.IfName,
-	)
-	return invoke.ExecPluginWithoutResult(ctx, pluginPath, req.Config, args, nil)
-}
-
-func findIPAMPlugin(ipamType string) (string, error) {
-	cniPath := os.Getenv("CNI_PATH")
-	if cniPath == "" {
-		return "", fmt.Errorf("CNI_PATH is not set; cannot find IPAM plugin %q", ipamType)
-	}
-	pluginPath, err := invoke.FindInPath(ipamType, filepath.SplitList(cniPath))
-	if err != nil {
-		return "", fmt.Errorf("IPAM plugin %q not found in CNI_PATH %q: %w", ipamType, cniPath, err)
-	}
-	klog.V(4).InfoS("Found IPAM plugin", "type", ipamType, "path", pluginPath)
-	return pluginPath, nil
 }
 
 // shortID returns the first 12 characters of a container ID for concise logging.

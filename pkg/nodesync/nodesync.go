@@ -7,9 +7,8 @@
 //
 //	ip route add <node.spec.podCIDR> via <node.status.addresses[InternalIP]>
 //
-// It also writes a per-node CNI config to the host filesystem so that the
-// host-local IPAM plugin allocates IPs from this node's unique pod CIDR
-// (node.spec.podCIDR) rather than a static, shared subnet.
+// It also writes a minimal per-node CNI config to the host filesystem.
+// IP allocation itself is handled in-process by the agent's IPAM allocator.
 package nodesync
 
 import (
@@ -122,10 +121,10 @@ func (c *Controller) Run(ctx context.Context) (ownPodCIDR string, err error) {
 	return ownNode.Spec.PodCIDR, nil
 }
 
-// WriteCNIConfig generates a per-node CNI config from podCIDR and writes it
-// to the path given at construction time.
-func (c *Controller) WriteCNIConfig(podCIDR string) error {
-	return writeCNIConfig(c.cniConfPath, podCIDR)
+// WriteCNIConfig writes a minimal CNI config (no IPAM section — IP allocation
+// is handled in-process by the agent) to the path given at construction time.
+func (c *Controller) WriteCNIConfig() error {
+	return writeCNIConfig(c.cniConfPath)
 }
 
 // ── event handlers ────────────────────────────────────────────────────────────
@@ -256,35 +255,14 @@ func internalIP(node *corev1.Node) string {
 
 // ── CNI config writer ─────────────────────────────────────────────────────────
 
-// writeCNIConfig generates a host-local IPAM config for podCIDR and writes it
-// to path.  The gateway is derived as the first host address in the subnet
-// (e.g. 10.244.1.1 for 10.244.1.0/24).  host-local skips the gateway address
-// when allocating, so pods start from the second usable host IP.
-func writeCNIConfig(path, podCIDR string) error {
-	_, subnet, err := net.ParseCIDR(podCIDR)
-	if err != nil {
-		return fmt.Errorf("invalid pod CIDR %q: %w", podCIDR, err)
-	}
-	gw := firstHostIP(subnet)
-
-	type ipamRange struct {
-		Subnet  string `json:"subnet"`
-		Gateway string `json:"gateway"`
-	}
-	type route struct {
-		Dst string `json:"dst"`
-	}
-	type ipam struct {
-		Type   string        `json:"type"`
-		Ranges [][]ipamRange `json:"ranges"`
-		Routes []route       `json:"routes"`
-	}
+// writeCNIConfig writes a minimal purenet CNI config to path. There is no IPAM
+// section because IP allocation is handled in-process by the agent.
+func writeCNIConfig(path string) error {
 	type cniConf struct {
 		CNIVersion string `json:"cniVersion"`
 		Name       string `json:"name"`
 		Type       string `json:"type"`
 		MTU        int    `json:"mtu"`
-		IPAM       ipam   `json:"ipam"`
 	}
 
 	conf := cniConf{
@@ -292,13 +270,6 @@ func writeCNIConfig(path, podCIDR string) error {
 		Name:       "purenet",
 		Type:       "purenet",
 		MTU:        1500,
-		IPAM: ipam{
-			Type: "host-local",
-			Ranges: [][]ipamRange{
-				{{Subnet: podCIDR, Gateway: gw.String()}},
-			},
-			Routes: []route{{"0.0.0.0/0"}},
-		},
 	}
 
 	data, err := json.MarshalIndent(conf, "", "  ")
@@ -316,13 +287,4 @@ func writeCNIConfig(path, podCIDR string) error {
 		return fmt.Errorf("renaming CNI config: %w", err)
 	}
 	return nil
-}
-
-// firstHostIP returns the first usable host address in the subnet by
-// incrementing the last byte of the network address by 1.
-func firstHostIP(subnet *net.IPNet) net.IP {
-	ip := make(net.IP, len(subnet.IP))
-	copy(ip, subnet.IP)
-	ip[len(ip)-1]++
-	return ip
 }

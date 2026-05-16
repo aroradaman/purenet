@@ -18,12 +18,14 @@ import (
 
 	"github.com/aroradaman/purenet/pkg/agent"
 	"github.com/aroradaman/purenet/pkg/cni"
+	"github.com/aroradaman/purenet/pkg/ipam"
 	"github.com/aroradaman/purenet/pkg/nodesync"
 )
 
 const (
 	logFile     = "/var/log/purenet/purenet.log"
 	cniConfPath = "/host/etc/cni/net.d/10-purenet.conf"
+	ipamDataDir = "/var/lib/cni/networks/purenet"
 )
 
 func init() {
@@ -76,12 +78,18 @@ func main() {
 		klog.Fatalf("Node sync failed: %v", err)
 	}
 
-	// Overwrite the CNI config with the per-node IPAM subnet so host-local
-	// allocates IPs from this node's unique cidr rather than a shared pool.
-	if err := syncer.WriteCNIConfig(ownPodCIDR); err != nil {
-		klog.Fatalf("Failed to write per-node CNI config (podCIDR=%s): %v", ownPodCIDR, err)
+	// Write a minimal per-node CNI config (no IPAM section — allocation is
+	// handled in-process by the agent).
+	if err := syncer.WriteCNIConfig(); err != nil {
+		klog.Fatalf("Failed to write per-node CNI config: %v", err)
 	}
 	klog.InfoS("CNI config written", "path", cniConfPath, "podCIDR", ownPodCIDR)
+
+	// ── In-process IPAM ───────────────────────────────────────────────────────
+	alloc, err := ipam.New(ownPodCIDR, ipamDataDir)
+	if err != nil {
+		klog.Fatalf("Failed to create IPAM allocator (podCIDR=%s): %v", ownPodCIDR, err)
+	}
 
 	// ── gRPC server ───────────────────────────────────────────────────────────
 	socketPath := cni.DefaultSocketPath
@@ -96,7 +104,7 @@ func main() {
 	}
 
 	srv := grpc.NewServer()
-	cni.RegisterCNIBackendServer(srv, agent.NewServer())
+	cni.RegisterCNIBackendServer(srv, agent.NewServer(alloc))
 
 	klog.InfoS("purenet agent starting", "socket", socketPath, "podCIDR", ownPodCIDR)
 
