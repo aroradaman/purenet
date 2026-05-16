@@ -3,14 +3,15 @@
 package network
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 
 	"github.com/vishvananda/netlink"
+	"sigs.k8s.io/knftables"
 )
 
 const hostVethPrefix = "veth"
@@ -118,8 +119,8 @@ func EnableProxyARP(vethName string) error {
 	return nil
 }
 
-// SetupMasquerade adds an iptables POSTROUTING MASQUERADE rule so that pod
-// traffic leaving the node (destination outside podCIDR) is SNAT'd to the
+// SetupMasquerade installs an nftables POSTROUTING MASQUERADE rule so that
+// pod traffic leaving the node (destination outside podCIDR) is SNAT'd to the
 // node's IP.
 //
 // Without this, pods can only be reached from the local node.  When a pod
@@ -129,24 +130,47 @@ func EnableProxyARP(vethName string) error {
 // MASQUERADE ensures the source is rewritten to the node IP so the reply
 // takes the normal reverse path through conntrack.
 //
-// The rule is idempotent: a -C check runs first and the -A is skipped if the
-// rule already exists.
-func SetupMasquerade(podCIDR string) error {
-	rule := []string{
-		"-t", "nat",
-		"-s", podCIDR, "!", "-d", podCIDR,
-		"-j", "MASQUERADE",
+// The operation is fully idempotent: the table and chain are created with
+// tx.Add (no-op if they already exist), the chain is flushed, and the rule is
+// (re)added — all in a single atomic nft transaction.
+func SetupMasquerade(ctx context.Context, podCIDR string) error {
+	nft, err := knftables.New(knftables.IPv4Family, "purenet")
+	if err != nil {
+		return fmt.Errorf("nftables not available: %w", err)
 	}
 
-	// -C: check – exit 0 if the rule already exists.
-	check := exec.Command("iptables", append([]string{"-C", "POSTROUTING"}, rule[2:]...)...)
-	if err := check.Run(); err == nil {
-		return nil // already present
-	}
+	tx := nft.NewTransaction()
 
-	add := exec.Command("iptables", append([]string{"-A", "POSTROUTING"}, rule[2:]...)...)
-	if out, err := add.CombinedOutput(); err != nil {
-		return fmt.Errorf("iptables -A POSTROUTING MASQUERADE failed: %w\n%s", err, out)
+	// Create the table if it does not exist.
+	tx.Add(&knftables.Table{
+		Family: knftables.IPv4Family,
+		Name:   "purenet",
+	})
+
+	// Create the base chain (no-op if it already exists), then flush it so
+	// we always land in a known-good state after an agent restart.
+	tx.Add(&knftables.Chain{
+		Name:     "postrouting",
+		Type:     knftables.PtrTo(knftables.NATType),
+		Hook:     knftables.PtrTo(knftables.PostroutingHook),
+		Priority: knftables.PtrTo(knftables.SNATPriority),
+	})
+	tx.Flush(&knftables.Chain{Name: "postrouting"})
+
+	// MASQUERADE packets whose source is in podCIDR but whose destination is
+	// outside it (i.e. leaving the node for an external address or another
+	// node's IP).
+	tx.Add(&knftables.Rule{
+		Chain: "postrouting",
+		Rule: knftables.Concat(
+			"ip saddr", podCIDR,
+			"ip daddr !=", podCIDR,
+			"masquerade",
+		),
+	})
+
+	if err := nft.Run(ctx, tx); err != nil {
+		return fmt.Errorf("nftables masquerade setup failed: %w", err)
 	}
 	return nil
 }

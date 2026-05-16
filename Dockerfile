@@ -28,7 +28,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ─────────────────────────────────────────────
 FROM alpine:3.21
 
-RUN apk add --no-cache iptables
+RUN apk add --no-cache nftables
 
 # CNI shim — copied to the host by install.sh.
 COPY --from=builder /purenet /opt/cni/bin/purenet

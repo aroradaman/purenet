@@ -19,6 +19,7 @@ import (
 	"github.com/aroradaman/purenet/pkg/agent"
 	"github.com/aroradaman/purenet/pkg/cni"
 	"github.com/aroradaman/purenet/pkg/ipam"
+	"github.com/aroradaman/purenet/pkg/network"
 	"github.com/aroradaman/purenet/pkg/nodesync"
 )
 
@@ -90,6 +91,14 @@ func main() {
 	if err != nil {
 		klog.Fatalf("Failed to create IPAM allocator (podCIDR=%s): %v", ownPodCIDR, err)
 	}
+
+	// ── nftables masquerade ───────────────────────────────────────────────────
+	// SNAT pod traffic leaving the node so that return packets can find their
+	// way back.  Uses a dedicated "purenet" nftables table.
+	if err := network.SetupMasquerade(ctx, ownPodCIDR); err != nil {
+		klog.Fatalf("Failed to set up nftables masquerade (podCIDR=%s): %v", ownPodCIDR, err)
+	}
+	klog.InfoS("nftables masquerade configured", "podCIDR", ownPodCIDR)
 
 	// ── gRPC server ───────────────────────────────────────────────────────────
 	socketPath := cni.DefaultSocketPath
