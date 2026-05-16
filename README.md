@@ -133,15 +133,15 @@ Pod A (10.244.0.5) on Node A          Node B                  kube-apiserver
         │  dst: 10.96.0.1:443           │                           │
         │  default route via 10.244.0.1 │                           │
         │  ARP for 10.244.0.1 →         │                           │
-        │    host veth responds          │                           │
-        │  packet arrives at Node A      │                           │
+        │    host veth responds         │                           │
+        │  packet arrives at Node A     │                           │
         │                               │                           │
         │  kube-proxy DNAT:             │                           │
         │    10.96.0.1:443 → 172.18.0.4:6443                        │
         │                               │                           │
-        │  host route (nodesync):        │                           │
+        │  host route (nodesync):       │                           │
         │    10.244.0.0/24 is local →   │                           │
-        │    packet forwarded to 172.18.0.4 (Node B Docker IP)       │
+        │    packet forwarded to 172.18.0.4 (Node B Docker IP)      │
         │                               │                           │
         │                        src: 10.244.0.5                    │
         │                        dst: 172.18.0.4:6443               │
