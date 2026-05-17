@@ -4,9 +4,8 @@
 // networking so pods on this node can reach pods on every other node without
 // NAT.
 //
-// Concrete forwarding strategies are plugged in via the NodeSyncer interface,
-// making it straightforward to add new backends (e.g. VXLAN overlay) without
-// touching the agent startup code.
+// Concrete forwarding strategies are plugged in via the NodeSyncer interface.
+// Choose a backend at startup via New(); the rest of the agent is unaffected.
 package nodesync
 
 import (
@@ -15,7 +14,21 @@ import (
 	"fmt"
 	"os"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+)
+
+// Mode selects how inter-node pod traffic is forwarded.
+type Mode string
+
+const (
+	// ModeHostGateway programs a direct host route via the remote node IP.
+	// Requires all cluster nodes to be on the same L2 segment.
+	ModeHostGateway Mode = "host-gateway"
+
+	// ModeVXLAN builds a UDP overlay (VNI 42, port 4789) so nodes can
+	// communicate across routed subnets without any L2 adjacency requirement.
+	ModeVXLAN Mode = "vxlan"
 )
 
 // NodeSyncer watches Kubernetes Node objects and maintains inter-node
@@ -31,11 +44,33 @@ type NodeSyncer interface {
 	WriteCNIConfig() error
 }
 
-// New returns a NodeSyncer backed by direct host routes (host-gateway mode).
-// Each remote node gets an "ip route add <podCIDR> via <nodeIP>" entry.
-// All cluster nodes must share an L2 segment for this to work.
-func New(nodeName string, client kubernetes.Interface, cniConfPath string) NodeSyncer {
-	return newHostGateway(nodeName, client, cniConfPath)
+// New returns the NodeSyncer for the requested mode.
+func New(nodeName string, client kubernetes.Interface, cniConfPath string, mode Mode) NodeSyncer {
+	switch mode {
+	case ModeVXLAN:
+		return newVXLAN(nodeName, client, cniConfPath)
+	default:
+		return newHostGateway(nodeName, client, cniConfPath)
+	}
+}
+
+// ── shared types and helpers ──────────────────────────────────────────────────
+
+// nodeRoute holds the currently-programmed state for a remote node.
+// Both backends use the same struct to track what they installed in the kernel
+// so they know what to remove on update/delete events.
+type nodeRoute struct {
+	podCIDR string
+	nodeIP  string
+}
+
+func internalIP(node *corev1.Node) string {
+	for _, a := range node.Status.Addresses {
+		if a.Type == corev1.NodeInternalIP {
+			return a.Address
+		}
+	}
+	return ""
 }
 
 // writeCNIConfig writes a minimal purenet CNI config to path. There is no

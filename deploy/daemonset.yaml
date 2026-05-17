@@ -57,7 +57,8 @@ spec:
           image: purenet:dev
           imagePullPolicy: Never
           args:
-           - -v=4
+            - --v=4
+            - --mode=vxlan
           env:
             # Kubernetes node name — used to look up node.spec.podCIDR and to
             # skip adding a route to ourselves when watching other nodes.

@@ -31,11 +31,6 @@ type hostGatewayController struct {
 	routes map[string]nodeRoute // nodeName → currently-programmed route
 }
 
-type nodeRoute struct {
-	podCIDR string
-	nodeIP  string
-}
-
 func newHostGateway(nodeName string, client kubernetes.Interface, cniConfPath string) *hostGatewayController {
 	return &hostGatewayController{
 		nodeName:    nodeName,
@@ -232,12 +227,3 @@ func delRoute(podCIDR, nodeIP string) error {
 
 func isEEXIST(err error) bool { return err != nil && err.Error() == "file exists" }
 func isENOENT(err error) bool { return err != nil && err.Error() == "no such process" }
-
-func internalIP(node *corev1.Node) string {
-	for _, a := range node.Status.Addresses {
-		if a.Type == corev1.NodeInternalIP {
-			return a.Address
-		}
-	}
-	return ""
-}

@@ -33,6 +33,7 @@ const (
 
 type options struct {
 	verbosity int
+	mode      string
 }
 
 func newAgentCommand() *cobra.Command {
@@ -47,8 +48,12 @@ func newAgentCommand() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().IntVarP(&opts.verbosity, "v", "v", 4,
+	f := cmd.Flags()
+	f.IntVarP(&opts.verbosity, "v", "v", 4,
 		"log verbosity level (0=errors only, 4=debug)")
+	f.StringVar(&opts.mode, "mode", string(nodesync.ModeVXLAN),
+		fmt.Sprintf("inter-node forwarding mode (%s, %s)",
+			nodesync.ModeHostGateway, nodesync.ModeVXLAN))
 
 	return cmd
 }
@@ -93,11 +98,15 @@ func run(opts *options) error {
 	defer cancel()
 
 	// ── Node route sync ───────────────────────────────────────────────────────
-	// Start the node informer. It will:
-	//   1. Add a host route for each existing node's pod CIDR on startup.
-	//   2. React to node add/update/delete events throughout the agent's life.
-	//   3. Return our own node's pod CIDR so we can configure IPAM correctly.
-	syncer := nodesync.New(nodeName, k8s, cniConfPath)
+	mode := nodesync.Mode(opts.mode)
+	switch mode {
+	case nodesync.ModeHostGateway, nodesync.ModeVXLAN:
+	default:
+		return fmt.Errorf("unknown --mode %q; valid values: %s, %s",
+			opts.mode, nodesync.ModeHostGateway, nodesync.ModeVXLAN)
+	}
+
+	syncer := nodesync.New(nodeName, k8s, cniConfPath, mode)
 	ownPodCIDR, err := syncer.Run(ctx)
 	if err != nil {
 		return fmt.Errorf("node sync: %w", err)

@@ -1,7 +1,7 @@
 # PureNet
 
 A learning-grade CNI plugin for Kubernetes written in Go.  
-It follows the same **shim → agent** architecture used by production CNIs like [Antrea](https://antrea.io), and implements host-gateway inter-node routing in the style of [kindnet](https://github.com/aojea/kindnet).
+It follows the same **shim → agent** architecture used by production CNIs like [Antrea](https://antrea.io), with pluggable inter-node forwarding — VXLAN overlay (default) or host-gateway.
 
 ---
 
@@ -56,25 +56,36 @@ The brain. Runs with `hostNetwork: true` and `privileged: true`. Responsible for
 | **IPAM** | In-process allocator (`pkg/ipam`): assigns IPs from the node's pod CIDR without forking any external binary; state is persisted to `/var/lib/cni/networks/purenet/allocations.cbor` using CBOR |
 | **Host routes** | Adds a `/32` route on the host for each pod IP so kubelet probes reach the pod |
 | **Proxy ARP** | Enables `proxy_arp` on host veths so pods can ARP-resolve their default gateway |
-| **Node sync** | Watches Kubernetes `Node` objects and programs inter-node routes (see below) |
+| **Node sync** | Watches Kubernetes `Node` objects; programs inter-node forwarding via VXLAN overlay or direct host routes depending on `--mode` (see below) |
 | **CNI config** | Writes a minimal `/etc/cni/net.d/10-purenet.conf` per node (no IPAM section needed) |
 
-#### `pkg/nodesync` — host-gateway inter-node routing
+#### `pkg/nodesync` — pluggable inter-node forwarding
 
-Kubernetes assigns each node a unique pod CIDR (e.g. `/24` from a `/16` pool) via `node.spec.podCIDR`.
-The node-sync controller uses a Kubernetes node informer to watch for node additions, updates, and deletions, and maintains host routes so pods can communicate across nodes:
+`pkg/nodesync` exposes a `NodeSyncer` interface so forwarding strategies can be swapped without touching the agent. The backend is chosen at startup via the `--mode` flag:
+
+| Mode | Default | Mechanism | Node requirement |
+|---|---|---|---|
+| `vxlan` | ✓ | UDP overlay on `purenet-gw` (VNI 42, port 4789) | IP reachability only |
+| `host-gateway` | | Direct `ip route` via remote node IP | L2 adjacency |
+
+**VXLAN mode** — each node creates a `purenet-gw` VXLAN interface on startup. For every remote node, three kernel objects are installed:
 
 ```
-# On node A (pod CIDR 10.244.0.0/24):
+# On node A (10.244.0.0/24), for node B (10.244.1.0/24 on host 172.18.0.4):
+ip route add 10.244.1.0/24 via 10.244.1.0 dev purenet-gw onlink   # 1. route
+ip neigh add 10.244.1.0 dev purenet-gw lladdr 02:00:0a:f4:01:00 nud permanent  # 2. ARP
+bridge fdb add 02:00:0a:f4:01:00 dev purenet-gw dst 172.18.0.4    # 3. FDB
+```
+
+VTEP MAC addresses are derived deterministically from pod CIDR network addresses (`10.244.1.0` → `02:00:0a:f4:01:00`) so no node annotations or extra API calls are needed. Packets are encapsulated in UDP/VXLAN and traverse any routed network.
+
+**Host-gateway mode** — simpler and lower overhead, but requires all nodes to share an L2 segment:
+
+```
+# On node A (10.244.0.0/24):
 ip route add 10.244.1.0/24 via 172.18.0.4   # node B
 ip route add 10.244.2.0/24 via 172.18.0.5   # node C
-
-# On node B (pod CIDR 10.244.1.0/24):
-ip route add 10.244.0.0/24 via 172.18.0.3   # node A
-ip route add 10.244.2.0/24 via 172.18.0.5   # node C
 ```
-
-This is the same approach as kindnet's host-gateway mode: no overlay, no NAT, source IPs preserved end-to-end.
 
 #### `pkg/cni` — gRPC contract
 
@@ -126,7 +137,7 @@ containerd  ← pod is now network-ready
 
 ---
 
-## Packet flow (cross-node, pod → service)
+## Packet flow (cross-node, pod → service, host-gateway mode)
 
 ```
 Pod A (10.244.0.5) on Node A          Node B                  kube-apiserver
@@ -159,7 +170,8 @@ Pod A (10.244.0.5) on Node A          Node B                  kube-apiserver
 reply reaches pod                       │
 ```
 
-No NAT. The return packet uses the host-gateway route programmed by `nodesync`.
+No NAT. The return packet uses the host-gateway route programmed by `nodesync`.  
+In VXLAN mode the same flow applies, but the inter-node hop is encapsulated in a UDP/VXLAN frame by `purenet-gw` instead of travelling over a plain L2 route.
 
 ---
 
@@ -176,7 +188,7 @@ purenet/
 │   ├── network/        # Linux network primitives: veth, routes, proxy ARP
 │   ├── ipam/           # In-process IP allocator: Add/Del/Check + CBOR persistence
 │   ├── agent/          # CmdAdd/Del/Check implementation, wires veth + IPAM + routes
-│   └── nodesync/       # Kubernetes node informer + host-gateway route manager
+│   └── nodesync/       # NodeSyncer interface + vxlan and host-gateway backends
 ├── deploy/
 │   ├── kind-config.yaml  # Kind cluster config (disableDefaultCNI, podSubnet)
 │   ├── rbac.yaml         # ServiceAccount, ClusterRole, ClusterRoleBinding
@@ -229,4 +241,4 @@ make kind-down
 
 **In-process IPAM** — IP allocation is handled entirely inside the agent by `pkg/ipam.Allocator`. It keeps two in-memory maps (`containerID→IP` and `IP→containerID`) protected by a mutex, derives the gateway as the first host address in the subnet, and scans from offset 2 to find a free IP on each `Add`. State is persisted to disk as a CBOR file (`allocations.cbor`) using an atomic tmp-file + rename so allocations survive agent restarts without double-allocating IPs. This removes the fork/exec overhead on every pod event and eliminates the external `host-local` binary dependency from the image entirely.
 
-**Host-gateway routing** — each node gets a unique `/24` from the cluster's `/16` pod CIDR. The `nodesync` controller maintains one `ip route` entry per remote node. No overlay, no NAT.
+**Pluggable inter-node forwarding** — `pkg/nodesync` defines a `NodeSyncer` interface; the agent selects a backend at startup via `--mode`. The default (`vxlan`) builds a UDP overlay on a `purenet-gw` VXLAN interface (VNI 42) so nodes can communicate across routed subnets without L2 adjacency. The `host-gateway` backend is a simpler alternative that programs a direct `ip route` per remote node; it requires L2 adjacency but has no encapsulation overhead. Both preserve source IPs end-to-end with no NAT.
