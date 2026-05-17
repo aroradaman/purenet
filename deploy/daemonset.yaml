@@ -56,10 +56,9 @@ spec:
         - name: agent
           image: purenet:dev
           imagePullPolicy: Never
+          args:
+           - -v=4
           env:
-            # Tune log verbosity: 0=errors only, 4=full debug.
-            - name: PURENET_LOG_V
-              value: "4"
             # Kubernetes node name — used to look up node.spec.podCIDR and to
             # skip adding a route to ourselves when watching other nodes.
             - name: NODE_NAME
