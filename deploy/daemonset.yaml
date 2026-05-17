@@ -49,17 +49,14 @@ spec:
       containers:
         # ── agent ───────────────────────────────────────────────────────────
         # Long-running gRPC server.  Watches Kubernetes nodes to maintain
-        # host routes (ip route add <remote-pod-cidr> via <remote-node-ip>)
-        # and writes the per-node CNI config so IPAM allocates from the right
-        # /24.  Every time containerd invokes the purenet shim, the shim
+        # inter-node forwarding state (host routes or VXLAN FDB/ARP/route
+        # entries depending on PURENET_MODE) and writes the per-node CNI
+        # config.  Every time containerd invokes the purenet shim, the shim
         # connects here and forwards the CNI request via gRPC.
         - name: agent
           image: purenet:dev
           imagePullPolicy: Never
           env:
-            # IPAM forks host-local; it searches CNI_PATH for the binary.
-            - name: CNI_PATH
-              value: /opt/cni/bin
             # Tune log verbosity: 0=errors only, 4=full debug.
             - name: PURENET_LOG_V
               value: "4"
@@ -88,8 +85,9 @@ spec:
               mountPropagation: HostToContainer
 
             # ── IPAM state ────────────────────────────────────────────────
-            # host-local stores IP allocations at /var/lib/cni/networks/.
-            # Must be the host path so allocations survive agent pod restarts.
+            # The in-process IPAM allocator persists allocations under
+            # /var/lib/cni/networks/purenet/.  Host-path mount ensures
+            # allocations survive agent pod restarts.
             - name: cni-state
               mountPath: /var/lib/cni
 
